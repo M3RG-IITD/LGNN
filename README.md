@@ -13,7 +13,7 @@ numpy-1.20.3, jax-0.2.24, jax-md-0.1.20, jaxlib-0.1.73, jraph-0.0.1.dev0
 
 1. __5 balls connected with springs__
 
-![spring](/assets/gifs/5_spring.gif)
+![/assets/gifs/5_spring.gif](/assets/gifs/5_spring.gif)
 
 
 ### __Hybrid Systems__
@@ -21,9 +21,9 @@ Seperately trained LGNN for spring system and pendulum system were used to simul
 
 1. __Hybrid system (two balls connected to double pendulum using sperings)__
 
-![spring](/assets/gifs/hybrid_no_force.gif)
+![/assets/gifs/hybrid_no_force.gif](/assets/gifs/hybrid_no_force.gif)
 
 
 2. __Hybrid system (two balls connected to double pendulum using sperings and a force of 10N in horizontal direction is applied to second bob.)__
 
-![spring](/assets/gifs/hybrid_force_10x.gif)
+![/assets/gifs/hybrid_force_10x.gif](/assets/gifs/hybrid_force_10x.gif)
