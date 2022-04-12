@@ -62,6 +62,14 @@ def MSE(y_act, y_pred):
     return jnp.mean(jnp.square(y_pred - y_act))
 
 
+def L2error(y_act, y_pred):
+    return jnp.mean(jnp.square(y_pred - y_act))
+
+
+def L1error(y_act, y_pred):
+    return jnp.mean(jnp.abs(y_pred - y_act))
+
+
 def batch_MSE(ys_act, ys_pred):
     return vmap(MSE, in_axes=(0, 0), out_axes=0)(ys_act, ys_pred)
 

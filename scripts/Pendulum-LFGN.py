@@ -28,7 +28,7 @@ sys.path.append(MAINPATH)  # nopep8
 import jraph
 import src
 from jax.config import config
-from src import lnn
+from src import fgn, lnn
 from src.graph import *
 from src.lnn import acceleration, accelerationFull, accelerationTV
 from src.md import *
@@ -85,7 +85,7 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
         "%m-%d-%Y_%H-%M-%S") + f"_{datapoints}"
 
     PSYS = f"{N}-Pendulum"
-    TAG = f"lgnn"
+    TAG = f"lfgn"
     out_dir = f"../results"
 
     def _filename(name, tag=TAG):
@@ -207,76 +207,61 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
     senders, receivers = pendulum_connections(N)
     eorder = edge_order(N)
 
-    Ef = 1  # eij dim
-    Nf = dim
-    Oh = 1
-
-    Eei = 5
-    Nei = 5
-
-    hidden = 5
-    nhidden = 2
-
-    def get_layers(in_, out_):
-        return [in_] + [hidden]*nhidden + [out_]
-
-    def mlp(in_, out_, key, **kwargs):
-        return initialize_mlp(get_layers(in_, out_), key, **kwargs)
-
-    # # fne_params = mlp(Oh, Nei, key)
-    fneke_params = initialize_mlp([Oh, Nei], key)
-    fne_params = initialize_mlp([Oh, Nei], key)
-
-    fb_params = mlp(Ef, Eei, key)
-    fv_params = mlp(Nei+Eei, Nei, key)
-    fe_params = mlp(Nei, Eei, key)
-
-    ff1_params = mlp(Eei, 1, key)
-    ff2_params = mlp(Nei, 1, key)
-    ff3_params = mlp(dim+Nei, 1, key)
-    ke_params = initialize_mlp([1+Nei, 10, 10, 1], key, affine=[True])
-
-    Lparams = dict(fb=fb_params,
-                   fv=fv_params,
-                   fe=fe_params,
-                   ff1=ff1_params,
-                   ff2=ff2_params,
-                   ff3=ff3_params,
-                   fne=fne_params,
-                   fneke=fneke_params,
-                   ke=ke_params)
+    hidden_dim = [16, 16]
+    edgesize = 1
+    nodesize = 5
+    ee = 8
+    ne = 8
+    Lparams = dict(
+        ee_params=initialize_mlp([edgesize, ee], key),
+        ne_params=initialize_mlp([nodesize, ne], key),
+        e_params=initialize_mlp([ee+2*ne, *hidden_dim, ee], key),
+        n_params=initialize_mlp([2*ee+ne, *hidden_dim, ne], key),
+        g_params=initialize_mlp([ne, *hidden_dim, 1], key),
+        acc_params=initialize_mlp([ne, *hidden_dim, dim], key),
+    )
 
     if trainm:
         print("kinetic energy: learnable")
 
         def L_energy_fn(params, graph):
-            g, V, T = cal_graph(params, graph, eorder=eorder,
-                                useT=True)
-            return T - V
+            L = fgn.cal_energy(params, graph, mpass=mpass)
+            return L
 
     else:
         print("kinetic energy: 0.5mv^2")
 
         kin_energy = partial(lnn._T, mass=masses)
 
-        def L_energy_fn(params, graph):
-            g, V, T = cal_graph(params, graph, eorder=eorder,
-                                useT=True)
-            return kin_energy(graph.nodes["velocity"]) - V
+        raise Warning("KE = 0.5mv2 not implemented")
+
+        # def L_energy_fn(params, graph):
+        #     g, V, T = cal_graph(params, graph, eorder=eorder,
+        #                         useT=True)
+        #     return kin_energy(graph.nodes["velocity"]) - V
 
     R, V = Rs[0], Vs[0]
+    species = jnp.array(species).reshape(-1, 1)
+
+    def dist(*args):
+        disp = displacement(*args)
+        return jnp.sqrt(jnp.square(disp).sum())
+
+    dij = vmap(dist, in_axes=(0, 0))(R[senders], R[receivers])
 
     state_graph = jraph.GraphsTuple(nodes={
         "position": R,
         "velocity": V,
         "type": species,
     },
-        edges={},
+        edges={"dij": dij},
         senders=senders,
         receivers=receivers,
         n_node=jnp.array([N]),
         n_edge=jnp.array([senders.shape[0]]),
         globals={})
+
+    L_energy_fn(Lparams, state_graph)
 
     def energy_fn(species):
         senders, receivers = [np.array(i)
@@ -286,7 +271,7 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
             "velocity": V,
             "type": species
         },
-            edges={},
+            edges={"dij": dij},
             senders=senders,
             receivers=receivers,
             n_node=jnp.array([R.shape[0]]),
@@ -296,8 +281,12 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
         def apply(R, V, params):
             state_graph.nodes.update(position=R)
             state_graph.nodes.update(velocity=V)
+            state_graph.edges.update(dij=vmap(dist, in_axes=(0, 0))(R[senders], R[receivers])
+                                     )
             return L_energy_fn(params, state_graph)
         return apply
+
+    species = jnp.array(species).reshape(-1, 1)
 
     apply_fn = energy_fn(species)
     v_apply_fn = vmap(apply_fn, in_axes=(None, 0))
@@ -427,13 +416,13 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
                 "ifdrag": ifdrag,
                 "trainm": trainm,
             }
-            savefile(f"lgnn_trained_model_{ifdrag}_{trainm}.dil",
+            savefile(f"lfgn_trained_model_{ifdrag}_{trainm}.dil",
                      params, metadata=metadata)
             savefile(f"loss_array_{ifdrag}_{trainm}.dil",
                      (larray, ltarray), metadata=metadata)
             if last_loss > larray[-1]:
                 last_loss = larray[-1]
-                savefile(f"lgnn_trained_model_{ifdrag}_{trainm}_low.dil",
+                savefile(f"lfgn_trained_model_{ifdrag}_{trainm}_low.dil",
                          params, metadata=metadata)
 
     fig, axs = panel(1, 1)
@@ -451,7 +440,7 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
         "trainm": trainm,
     }
     params = get_params(opt_state)
-    savefile(f"lgnn_trained_model_{ifdrag}_{trainm}.dil",
+    savefile(f"lfgn_trained_model_{ifdrag}_{trainm}.dil",
              params, metadata=metadata)
     savefile(f"loss_array_{ifdrag}_{trainm}.dil",
              (larray, ltarray), metadata=metadata)

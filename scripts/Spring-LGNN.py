@@ -6,7 +6,6 @@ import json
 import sys
 from datetime import datetime
 from functools import partial, wraps
-from statistics import mode
 
 import fire
 import jax
@@ -17,12 +16,19 @@ from jax.experimental import optimizers
 from jax_md import space
 from shadow.plot import *
 from sklearn.metrics import r2_score
-from sympy import LM
-from torch import batch_norm_gather_stats_with_counts
 
 from psystems.nsprings import (chain, edge_order, get_connections,
                                get_fully_connected_senders_and_receivers,
                                get_fully_edge_order)
+
+# from statistics import mode
+
+
+# from sympy import LM
+
+
+# from torch import batch_norm_gather_stats_with_counts
+
 
 MAINPATH = ".."  # nopep8
 sys.path.append(MAINPATH)  # nopep8
@@ -38,8 +44,8 @@ from src.models import MSE, initialize_mlp
 from src.nve import nve
 from src.utils import *
 
-config.update("jax_enable_x64", True)
-config.update("jax_debug_nans", True)
+# config.update("jax_enable_x64", True)
+# config.update("jax_debug_nans", True)
 # jax.config.update('jax_platform_name', 'gpu')
 
 
@@ -52,13 +58,37 @@ def pprint(*args, namespace=globals()):
         print(f"{namestr(arg, namespace)[0]}: {arg}")
 
 
-def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
-         dt=1.0e-3, ifdrag=0, stride=100, trainm=1, grid=False, mpass=1, lr=0.001, withdata=None, datapoints=None, batch_size=1000):
+def wrap_main(f):
+    def fn(*args, **kwargs):
+        config = (args, kwargs)
+        print("Configs: ")
+        print(f"Args: ")
+        for i in args:
+            print(i)
+        print(f"KwArgs: ")
+        for k, v in kwargs.items():
+            print(k, ":", v)
+        return f(*args, **kwargs, config=config)
 
-    print("Configs: ")
-    pprint(N, epochs, seed, rname,
-           dt, stride, lr, ifdrag, batch_size,
-           namespace=locals())
+    return fn
+
+
+def Main(N=3, epochs=10000, seed=42, rname=True, saveat=10, error_fn="L2error",
+         dt=1.0e-3, ifdrag=0, stride=100, trainm=1, grid=False, mpass=1, lr=0.001,
+         withdata=None, datapoints=None, batch_size=1000):
+
+    return wrap_main(main)(N=N, epochs=epochs, seed=seed, rname=rname, saveat=saveat, error_fn=error_fn,
+                           dt=dt, ifdrag=ifdrag, stride=stride, trainm=trainm, grid=grid, mpass=mpass, lr=lr,
+                           withdata=withdata, datapoints=datapoints, batch_size=batch_size)
+
+
+def main(N=3, epochs=10000, seed=42, rname=True, saveat=10, error_fn="L2error",
+         dt=1.0e-3, ifdrag=0, stride=100, trainm=1, grid=False, mpass=1, lr=0.001, withdata=None, datapoints=None, batch_size=1000, config=None):
+
+    # print("Configs: ")
+    # pprint(N, epochs, seed, rname,
+    #        dt, stride, lr, ifdrag, batch_size,
+    #        namespace=locals())
 
     randfilename = datetime.now().strftime(
         "%m-%d-%Y_%H-%M-%S") + f"_{datapoints}"
@@ -69,7 +99,7 @@ def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
 
     def _filename(name, tag=TAG):
         rstring = randfilename if (rname and (tag != "data")) else (
-            "0" if (tag == "data") or (withdata == None) else f"0_{withdata}")
+            "0" if (tag == "data") or (withdata == None) else f"{withdata}")
         filename_prefix = f"{out_dir}/{PSYS}-{tag}/{rstring}/"
         file = f"{filename_prefix}/{name}"
         os.makedirs(os.path.dirname(file), exist_ok=True)
@@ -96,6 +126,8 @@ def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
     savefile = OUT(src.io.savefile)
     save_ovito = OUT(src.io.save_ovito)
 
+    savefile(f"config_{ifdrag}_{trainm}.pkl", config)
+
     ################################################
     ################## CONFIG ######################
     ################################################
@@ -105,7 +137,7 @@ def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
     try:
         dataset_states = loadfile(f"model_states_{ifdrag}.pkl", tag="data")[0]
     except:
-        raise Exception("Generate dataset first.")
+        raise Exception("Generate dataset first. Use *-data.py file.")
 
     if datapoints is not None:
         dataset_states = dataset_states[:datapoints]
@@ -307,33 +339,26 @@ def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
 
     params["drag"] = initialize_mlp([1, 5, 5, 1], key)
 
-    acceleration_fn_model = accelerationFull(N, dim,
-                                             lagrangian=Lmodel,
-                                             constraints=None,
-                                             non_conservative_forces=drag)
+    acceleration_fn_model = jit(accelerationFull(N, dim,
+                                                 lagrangian=Lmodel,
+                                                 constraints=None,
+                                                 non_conservative_forces=drag))
     v_acceleration_fn_model = vmap(acceleration_fn_model, in_axes=(0, 0, None))
 
     ################################################
     ################## ML Training #################
     ################################################
 
+    LOSS = getattr(src.models, error_fn)
+
     @jit
     def loss_fn(params, Rs, Vs, Fs):
         pred = v_acceleration_fn_model(Rs, Vs, params)
-        return MSE(pred, Fs)
+        return LOSS(pred, Fs)
 
+    @jit
     def gloss(*args):
         return value_and_grad(loss_fn)(*args)
-
-    def update(i, opt_state, params, loss__, *data):
-        """ Compute the gradient for a batch and update the parameters """
-        value, grads_ = gloss(params, *data)
-        opt_state = opt_update(i, grads_, opt_state)
-        return opt_state, get_params(opt_state), value
-
-    @ jit
-    def step(i, ps, *args):
-        return update(i, *ps, *args)
 
     opt_init, opt_update_, get_params = optimizers.adam(lr)
 
@@ -343,6 +368,17 @@ def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
         grads_ = jax.tree_map(
             partial(jnp.clip, a_min=-1000.0, a_max=1000.0), grads_)
         return opt_update_(i, grads_, opt_state)
+
+    @jit
+    def update(i, opt_state, params, loss__, *data):
+        """ Compute the gradient for a batch and update the parameters """
+        value, grads_ = gloss(params, *data)
+        opt_state = opt_update(i, grads_, opt_state)
+        return opt_state, get_params(opt_state), value
+
+    @ jit
+    def step(i, ps, *args):
+        return update(i, *ps, *args)
 
     def batching(*args, size=None):
         L = len(args[0])
@@ -378,22 +414,31 @@ def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
     larray = []
     ltarray = []
     last_loss = 1000
+
+    larray += [loss_fn(params, Rs, Vs, Fs)]
+    ltarray += [loss_fn(params, Rst, Vst, Fst)]
+
+    def print_loss():
+        print(
+            f"Epoch: {epoch}/{epochs} Loss (mean of {error_fn}):  train={larray[-1]}, test={ltarray[-1]}")
+
+    print_loss()
+
     for epoch in range(epochs):
-        l = 0.0
         for data in zip(bRs, bVs, bFs):
             optimizer_step += 1
             opt_state, params, l_ = step(
                 optimizer_step, (opt_state, params, 0), *data)
-            l += l_
 
-        opt_state, params, l_ = step(
-            optimizer_step, (opt_state, params, 0), Rs, Vs, Fs)
+        # optimizer_step += 1
+        # opt_state, params, l_ = step(
+        #     optimizer_step, (opt_state, params, 0), Rs, Vs, Fs)
 
         if epoch % saveat == 0:
-            larray += [l_]
+            larray += [loss_fn(params, Rs, Vs, Fs)]
             ltarray += [loss_fn(params, Rst, Vst, Fst)]
-            print(
-                f"Epoch: {epoch}/{epochs} Loss (MSE):  train={larray[-1]}, test={ltarray[-1]}")
+            print_loss()
+
         if epoch % saveat == 0:
             metadata = {
                 "savedat": epoch,
@@ -412,8 +457,8 @@ def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
                          params, metadata=metadata)
 
     fig, axs = panel(1, 1)
-    plt.semilogy(larray, label="Training")
-    plt.semilogy(ltarray, label="Test")
+    plt.semilogy(larray[1:], label="Training")
+    plt.semilogy(ltarray[1:], label="Test")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
@@ -433,4 +478,4 @@ def main(N=3, epochs=10000, seed=42, rname=True, saveat=10,
              (larray, ltarray), metadata=metadata)
 
 
-fire.Fire(main)
+fire.Fire(Main)

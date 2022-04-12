@@ -68,7 +68,7 @@ def main(N=3, dt=1.0e-3, saveovito=0, datapoints=100, withdata=None, semilog=1, 
 
     def _filename(name, tag=TAG):
         rstring = randfilename if (rname and (tag != "data")) else (
-            "0" if (tag == "data") or (withdata == None) else f"0_{withdata}")
+            "0" if (tag == "data") or (withdata == None) else f"{withdata}")
         filename_prefix = f"{out_dir}/{PSYS}-{tag}/{rstring}/"
         file = f"{filename_prefix}/{name}"
         os.makedirs(os.path.dirname(file), exist_ok=True)
@@ -211,7 +211,7 @@ def main(N=3, dt=1.0e-3, saveovito=0, datapoints=100, withdata=None, semilog=1, 
             return acceleration_fn_model(R, V, params)*mass.reshape(-1, 1)
 
     try:
-        params = loadfile(f"lnn_trained_model_{ifdrag}_{withdata}.dil")[0]
+        params = loadfile(f"lnn_trained_model_{ifdrag}_{trainm}.dil")[0]
     except:
         warning("Using unspecified taining model.")
         params = loadfile(f"lnn_trained_model.dil")[0]

@@ -28,7 +28,7 @@ sys.path.append(MAINPATH)  # nopep8
 import jraph
 import src
 from jax.config import config
-from src import lnn
+from src import fgn, lnn
 from src.graph import *
 from src.lnn import acceleration, accelerationFull, accelerationTV
 from src.md import *
@@ -85,7 +85,7 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
         "%m-%d-%Y_%H-%M-%S") + f"_{datapoints}"
 
     PSYS = f"{N}-Pendulum"
-    TAG = f"lgnn"
+    TAG = f"fgn"
     out_dir = f"../results"
 
     def _filename(name, tag=TAG):
@@ -207,78 +207,65 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
     senders, receivers = pendulum_connections(N)
     eorder = edge_order(N)
 
-    Ef = 1  # eij dim
-    Nf = dim
-    Oh = 1
+    hidden_dim = [16, 16]
+    edgesize = 1
+    nodesize = 5
+    ee = 8
+    ne = 8
+    Lparams = dict(
+        ee_params=initialize_mlp([edgesize, ee], key),
+        ne_params=initialize_mlp([nodesize, ne], key),
+        e_params=initialize_mlp([ee+2*ne, *hidden_dim, ee], key),
+        n_params=initialize_mlp([2*ee+ne, *hidden_dim, ne], key),
+        g_params=initialize_mlp([ne, *hidden_dim, 1], key),
+        acc_params=initialize_mlp([ne, *hidden_dim, dim], key),
+    )
 
-    Eei = 5
-    Nei = 5
+    # if trainm:
+    #     print("kinetic energy: learnable")
 
-    hidden = 5
-    nhidden = 2
+    #     def L_energy_fn(params, graph):
+    #         g, V, T = cal_graph(params, graph, eorder=eorder,
+    #                             useT=True)
+    #         return T - V
 
-    def get_layers(in_, out_):
-        return [in_] + [hidden]*nhidden + [out_]
+    # else:
+    #     print("kinetic energy: 0.5mv^2")
 
-    def mlp(in_, out_, key, **kwargs):
-        return initialize_mlp(get_layers(in_, out_), key, **kwargs)
+    #     kin_energy = partial(lnn._T, mass=masses)
 
-    # # fne_params = mlp(Oh, Nei, key)
-    fneke_params = initialize_mlp([Oh, Nei], key)
-    fne_params = initialize_mlp([Oh, Nei], key)
-
-    fb_params = mlp(Ef, Eei, key)
-    fv_params = mlp(Nei+Eei, Nei, key)
-    fe_params = mlp(Nei, Eei, key)
-
-    ff1_params = mlp(Eei, 1, key)
-    ff2_params = mlp(Nei, 1, key)
-    ff3_params = mlp(dim+Nei, 1, key)
-    ke_params = initialize_mlp([1+Nei, 10, 10, 1], key, affine=[True])
-
-    Lparams = dict(fb=fb_params,
-                   fv=fv_params,
-                   fe=fe_params,
-                   ff1=ff1_params,
-                   ff2=ff2_params,
-                   ff3=ff3_params,
-                   fne=fne_params,
-                   fneke=fneke_params,
-                   ke=ke_params)
-
-    if trainm:
-        print("kinetic energy: learnable")
-
-        def L_energy_fn(params, graph):
-            g, V, T = cal_graph(params, graph, eorder=eorder,
-                                useT=True)
-            return T - V
-
-    else:
-        print("kinetic energy: 0.5mv^2")
-
-        kin_energy = partial(lnn._T, mass=masses)
-
-        def L_energy_fn(params, graph):
-            g, V, T = cal_graph(params, graph, eorder=eorder,
-                                useT=True)
-            return kin_energy(graph.nodes["velocity"]) - V
+    #     def L_energy_fn(params, graph):
+    #         g, V, T = cal_graph(params, graph, eorder=eorder,
+    #                             useT=True)
+    #         return kin_energy(graph.nodes["velocity"]) - V
 
     R, V = Rs[0], Vs[0]
+
+    species = jnp.array(species).reshape(-1, 1)
+
+    def dist(*args):
+        disp = displacement(*args)
+        return jnp.sqrt(jnp.square(disp).sum())
+
+    dij = vmap(dist, in_axes=(0, 0))(R[senders], R[receivers])
 
     state_graph = jraph.GraphsTuple(nodes={
         "position": R,
         "velocity": V,
         "type": species,
     },
-        edges={},
+        edges={"dij": dij},
         senders=senders,
         receivers=receivers,
         n_node=jnp.array([N]),
         n_edge=jnp.array([senders.shape[0]]),
         globals={})
 
-    def energy_fn(species):
+    def acceleration_fn(params, graph):
+        acc = fgn.cal_acceleration(params, graph, mpass=1)
+        return acc
+
+    def acc_fn(species):
         senders, receivers = [np.array(i)
                               for i in pendulum_connections(R.shape[0])]
         state_graph = jraph.GraphsTuple(nodes={
@@ -286,7 +273,7 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
             "velocity": V,
             "type": species
         },
-            edges={},
+            edges={"dij": dij},
             senders=senders,
             receivers=receivers,
             n_node=jnp.array([R.shape[0]]),
@@ -296,36 +283,41 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
         def apply(R, V, params):
             state_graph.nodes.update(position=R)
             state_graph.nodes.update(velocity=V)
-            return L_energy_fn(params, state_graph)
+            state_graph.edges.update(dij=vmap(dist, in_axes=(0, 0))(R[senders], R[receivers])
+                                     )
+            return acceleration_fn(params, state_graph)
         return apply
 
-    apply_fn = energy_fn(species)
+    apply_fn = jit(acc_fn(species))
     v_apply_fn = vmap(apply_fn, in_axes=(None, 0))
 
-    def Lmodel(x, v, params): return apply_fn(x, v, params["L"])
+    def acceleration_fn_model(x, v, params): return apply_fn(x, v, params["L"])
 
     params = {"L": Lparams}
 
-    def nndrag(v, params):
-        return - jnp.abs(models.forward_pass(params, v.reshape(-1), activation_fn=models.SquarePlus)) * v
+    print(acceleration_fn_model(R, V, params))
 
-    if ifdrag == 0:
-        print("Drag: 0.0")
+    # def nndrag(v, params):
+    #     return - jnp.abs(models.forward_pass(params, v.reshape(-1), activation_fn=models.SquarePlus)) * v
 
-        def drag(x, v, params):
-            return 0.0
-    elif ifdrag == 1:
-        print("Drag: -0.1*v")
+    # if ifdrag == 0:
+    #     print("Drag: 0.0")
 
-        def drag(x, v, params):
-            return vmap(nndrag, in_axes=(0, None))(v.reshape(-1), params["drag"]).reshape(-1, 1)
+    #     def drag(x, v, params):
+    #         return 0.0
+    # elif ifdrag == 1:
+    #     print("Drag: -0.1*v")
 
-    params["drag"] = initialize_mlp([1, 5, 5, 1], key)
+    #     def drag(x, v, params):
+    #         return vmap(nndrag, in_axes=(0, None))(v.reshape(-1), params["drag"]).reshape(-1, 1)
 
-    acceleration_fn_model = accelerationFull(N, dim,
-                                             lagrangian=Lmodel,
-                                             constraints=constraints,
-                                             non_conservative_forces=drag)
+    # params["drag"] = initialize_mlp([1, 5, 5, 1], key)
+
+    # acceleration_fn_model = accelerationFull(N, dim,
+    #                                          lagrangian=Lmodel,
+    #                                          constraints=constraints,
+    #                                          non_conservative_forces=drag)
+
     v_acceleration_fn_model = vmap(acceleration_fn_model, in_axes=(0, 0, None))
 
     ################################################
@@ -427,13 +419,13 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
                 "ifdrag": ifdrag,
                 "trainm": trainm,
             }
-            savefile(f"lgnn_trained_model_{ifdrag}_{trainm}.dil",
+            savefile(f"fgn_trained_model_{ifdrag}_{trainm}.dil",
                      params, metadata=metadata)
             savefile(f"loss_array_{ifdrag}_{trainm}.dil",
                      (larray, ltarray), metadata=metadata)
             if last_loss > larray[-1]:
                 last_loss = larray[-1]
-                savefile(f"lgnn_trained_model_{ifdrag}_{trainm}_low.dil",
+                savefile(f"fgn_trained_model_{ifdrag}_{trainm}_low.dil",
                          params, metadata=metadata)
 
     fig, axs = panel(1, 1)
@@ -451,7 +443,7 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
         "trainm": trainm,
     }
     params = get_params(opt_state)
-    savefile(f"lgnn_trained_model_{ifdrag}_{trainm}.dil",
+    savefile(f"fgn_trained_model_{ifdrag}_{trainm}.dil",
              params, metadata=metadata)
     savefile(f"loss_array_{ifdrag}_{trainm}.dil",
              (larray, ltarray), metadata=metadata)

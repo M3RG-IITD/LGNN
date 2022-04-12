@@ -40,7 +40,7 @@ config.update("jax_debug_nans", True)
 # jax.config.update('jax_platform_name', 'gpu')
 
 
-def main(N1=3, N2=None, dim=2, grid=False, saveat=100, runs=100, nconfig=1000, ifdrag=0):
+def main(N1=3, N2=None, dim=2, grid=False, saveat=100, runs=100, nconfig=1000, ifdrag=0, rname=False):
 
     if N2 is None:
         N2 = N1
@@ -50,8 +50,7 @@ def main(N1=3, N2=None, dim=2, grid=False, saveat=100, runs=100, nconfig=1000, i
     tag = f"{N}-Spring-data"
     seed = 42
     out_dir = f"../results"
-    rname = False
-    rstring = datetime.now().strftime("%m-%d-%Y_%H-%M-%S") if rname else "0"
+    rstring = datetime.now().strftime("%d-%m-%Y_%H-%M-%S") if rname else "0"
     filename_prefix = f"{out_dir}/{tag}/{rstring}/"
 
     def _filename(name):

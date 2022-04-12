@@ -6,7 +6,6 @@ import json
 import sys
 from datetime import datetime
 from functools import partial, wraps
-from statistics import mode
 
 import fire
 import jax
@@ -17,10 +16,19 @@ from jax.experimental import optimizers
 from jax_md import space
 from shadow.plot import *
 from sklearn.metrics import r2_score
-from torch import batch_norm_gather_stats_with_counts
 
-from psystems.npendulum import (PEF, edge_order, get_init, hconstraints,
-                                pendulum_connections)
+from psystems.nsprings import (chain, edge_order, get_connections,
+                               get_fully_connected_senders_and_receivers,
+                               get_fully_edge_order)
+
+# from statistics import mode
+
+
+# from sympy import LM
+
+
+# from torch import batch_norm_gather_stats_with_counts
+
 
 MAINPATH = ".."  # nopep8
 sys.path.append(MAINPATH)  # nopep8
@@ -28,7 +36,7 @@ sys.path.append(MAINPATH)  # nopep8
 import jraph
 import src
 from jax.config import config
-from src import lnn
+from src import fgn, lnn
 from src.graph import *
 from src.lnn import acceleration, accelerationFull, accelerationTV
 from src.md import *
@@ -36,8 +44,8 @@ from src.models import MSE, initialize_mlp
 from src.nve import nve
 from src.utils import *
 
-config.update("jax_enable_x64", True)
-config.update("jax_debug_nans", True)
+# config.update("jax_enable_x64", True)
+# config.update("jax_debug_nans", True)
 # jax.config.update('jax_platform_name', 'gpu')
 
 
@@ -65,16 +73,17 @@ def wrap_main(f):
     return fn
 
 
-def Main(N=2, epochs=10000, seed=42, rname=True, error_fn="L2error", mpass=1, saveat=10,
-         dt=1.0e-5, ifdrag=0, trainm=1, stride=1000, lr=0.001, datapoints=None, batch_size=1000):
+def Main(N=3, epochs=10000, seed=42, rname=True, saveat=10, error_fn="L2error",
+         dt=1.0e-3, ifdrag=0, stride=100, trainm=1, grid=False, mpass=1, lr=0.001,
+         withdata=None, datapoints=None, batch_size=1000):
 
-    return wrap_main(main)(N=N, epochs=epochs, seed=seed, rname=rname, error_fn=error_fn, mpass=mpass,
-                           dt=dt, ifdrag=ifdrag, trainm=trainm, stride=stride, lr=lr, datapoints=datapoints,
-                           batch_size=batch_size, saveat=saveat)
+    return wrap_main(main)(N=N, epochs=epochs, seed=seed, rname=rname, saveat=saveat, error_fn=error_fn,
+                           dt=dt, ifdrag=ifdrag, stride=stride, trainm=trainm, grid=grid, mpass=mpass, lr=lr,
+                           withdata=withdata, datapoints=datapoints, batch_size=batch_size)
 
 
-def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, saveat=10,
-         dt=1.0e-5, ifdrag=0, trainm=1, stride=1000, lr=0.001,  withdata=None, datapoints=None, batch_size=1000, config=None):
+def main(N=3, epochs=10000, seed=42, rname=True, saveat=10, error_fn="L2error",
+         dt=1.0e-3, ifdrag=0, stride=100, trainm=1, grid=False, mpass=1, lr=0.001, withdata=None, datapoints=None, batch_size=1000, config=None):
 
     # print("Configs: ")
     # pprint(N, epochs, seed, rname,
@@ -84,8 +93,8 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
     randfilename = datetime.now().strftime(
         "%m-%d-%Y_%H-%M-%S") + f"_{datapoints}"
 
-    PSYS = f"{N}-Pendulum"
-    TAG = f"lgnn"
+    PSYS = f"{N}-Spring"
+    TAG = f"fgn"
     out_dir = f"../results"
 
     def _filename(name, tag=TAG):
@@ -139,8 +148,8 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
         f"Total number of data points: {len(dataset_states)}x{model_states.position.shape[0]}")
 
     N, dim = model_states.position.shape[-2:]
-    species = jnp.zeros(N, dtype=int)
-    masses = jnp.ones(N)
+    species = jnp.zeros((N, 1), dtype=int)
+    masses = jnp.ones((N, 1))
 
     Rs, Vs, Fs = States().fromlist(dataset_states).get_array()
     Rs = Rs.reshape(-1, N, dim)
@@ -173,8 +182,8 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
     # def Lactual(x, v, params):
     #     return kin_energy(v) - pot_energy_orig(x)
 
-    def constraints(x, v, params):
-        return jax.jacobian(lambda x: hconstraints(x.reshape(-1, dim)), 0)(x)
+    # def constraints(x, v, params):
+    #     return jax.jacobian(lambda x: hconstraints(x.reshape(-1, dim)), 0)(x)
 
     # def external_force(x, v, params):
     #     F = 0*R
@@ -204,89 +213,82 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
     ################### ML Model ###################
     ################################################
 
-    senders, receivers = pendulum_connections(N)
-    eorder = edge_order(N)
-
-    Ef = 1  # eij dim
-    Nf = dim
-    Oh = 1
-
-    Eei = 5
-    Nei = 5
-
-    hidden = 5
-    nhidden = 2
-
-    def get_layers(in_, out_):
-        return [in_] + [hidden]*nhidden + [out_]
-
-    def mlp(in_, out_, key, **kwargs):
-        return initialize_mlp(get_layers(in_, out_), key, **kwargs)
-
-    # # fne_params = mlp(Oh, Nei, key)
-    fneke_params = initialize_mlp([Oh, Nei], key)
-    fne_params = initialize_mlp([Oh, Nei], key)
-
-    fb_params = mlp(Ef, Eei, key)
-    fv_params = mlp(Nei+Eei, Nei, key)
-    fe_params = mlp(Nei, Eei, key)
-
-    ff1_params = mlp(Eei, 1, key)
-    ff2_params = mlp(Nei, 1, key)
-    ff3_params = mlp(dim+Nei, 1, key)
-    ke_params = initialize_mlp([1+Nei, 10, 10, 1], key, affine=[True])
-
-    Lparams = dict(fb=fb_params,
-                   fv=fv_params,
-                   fe=fe_params,
-                   ff1=ff1_params,
-                   ff2=ff2_params,
-                   ff3=ff3_params,
-                   fne=fne_params,
-                   fneke=fneke_params,
-                   ke=ke_params)
-
-    if trainm:
-        print("kinetic energy: learnable")
-
-        def L_energy_fn(params, graph):
-            g, V, T = cal_graph(params, graph, eorder=eorder,
-                                useT=True)
-            return T - V
-
+    if grid:
+        print("It's a grid?")
+        a = int(np.sqrt(N))
+        senders, receivers = get_connections(a, a)
+        eorder = edge_order(len(senders))
     else:
-        print("kinetic energy: 0.5mv^2")
-
-        kin_energy = partial(lnn._T, mass=masses)
-
-        def L_energy_fn(params, graph):
-            g, V, T = cal_graph(params, graph, eorder=eorder,
-                                useT=True)
-            return kin_energy(graph.nodes["velocity"]) - V
+        print("It's a random?")
+        # senders, receivers = get_fully_connected_senders_and_receivers(N)
+        print("Creating Chain")
+        _, _, senders, receivers = chain(N)
+        eorder = edge_order(len(senders))
 
     R, V = Rs[0], Vs[0]
+
+    def dist(*args):
+        disp = displacement(*args)
+        return jnp.sqrt(jnp.square(disp).sum())
+
+    dij = vmap(dist, in_axes=(0, 0))(R[senders], R[receivers])
 
     state_graph = jraph.GraphsTuple(nodes={
         "position": R,
         "velocity": V,
         "type": species,
     },
-        edges={},
+        edges={"dij": dij},
         senders=senders,
         receivers=receivers,
         n_node=jnp.array([N]),
         n_edge=jnp.array([senders.shape[0]]),
         globals={})
 
-    def energy_fn(species):
-        senders, receivers = [np.array(i)
-                              for i in pendulum_connections(R.shape[0])]
+    # if trainm:
+    #     print("kinetic energy: learnable")
+
+    #     def L_energy_fn(params, graph):
+    #         L = fgn.cal_energy(params, graph, mpass=mpass)
+    #         return L
+
+    # else:
+    #     print("kinetic energy: 0.5mv^2")
+
+    #     kin_energy = partial(lnn._T, mass=masses)
+
+    #     raise Warning("KE = 0.5mv2 not implemented")
+
+    #     # def L_energy_fn(params, graph):
+    #     #     g, V, T = cal_graph(params, graph, mpass=mpass, eorder=eorder,
+    #     #                         useT=True, useonlyedge=True)
+    #     #     return kin_energy(graph.nodes["velocity"]) - V
+
+    hidden_dim = [16, 16]
+    edgesize = 1
+    nodesize = 5
+    ee = 8
+    ne = 8
+    Lparams = dict(
+        ee_params=initialize_mlp([edgesize, ee], key),
+        ne_params=initialize_mlp([nodesize, ne], key),
+        e_params=initialize_mlp([ee+2*ne, *hidden_dim, ee], key),
+        n_params=initialize_mlp([2*ee+ne, *hidden_dim, ne], key),
+        g_params=initialize_mlp([ne, *hidden_dim, 1], key),
+        acc_params=initialize_mlp([ne, *hidden_dim, dim], key),
+    )
+
+    def acceleration_fn(params, graph):
+        acc = fgn.cal_acceleration(params, graph, mpass=1)
+        return acc
+
+    def acc_fn(species):
         state_graph = jraph.GraphsTuple(nodes={
             "position": R,
             "velocity": V,
             "type": species
         },
-            edges={},
+            edges={"dij": dij},
             senders=senders,
             receivers=receivers,
             n_node=jnp.array([R.shape[0]]),
@@ -296,36 +298,43 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
         def apply(R, V, params):
             state_graph.nodes.update(position=R)
             state_graph.nodes.update(velocity=V)
-            return L_energy_fn(params, state_graph)
+            state_graph.edges.update(dij=vmap(dist, in_axes=(0, 0))(R[senders], R[receivers])
+                                     )
+            return acceleration_fn(params, state_graph)
         return apply
 
-    apply_fn = energy_fn(species)
+    apply_fn = acc_fn(species)
     v_apply_fn = vmap(apply_fn, in_axes=(None, 0))
 
-    def Lmodel(x, v, params): return apply_fn(x, v, params["L"])
+    def acceleration_fn_model(x, v, params): return apply_fn(x, v, params["L"])
 
     params = {"L": Lparams}
 
-    def nndrag(v, params):
-        return - jnp.abs(models.forward_pass(params, v.reshape(-1), activation_fn=models.SquarePlus)) * v
+    print(acceleration_fn_model(R, V, params))
 
-    if ifdrag == 0:
-        print("Drag: 0.0")
+    # print("lag: ", Lmodel(R, V, params))
 
-        def drag(x, v, params):
-            return 0.0
-    elif ifdrag == 1:
-        print("Drag: -0.1*v")
+    # def nndrag(v, params):
+    #     return - jnp.abs(models.forward_pass(params, v.reshape(-1), activation_fn=models.SquarePlus)) * v
 
-        def drag(x, v, params):
-            return vmap(nndrag, in_axes=(0, None))(v.reshape(-1), params["drag"]).reshape(-1, 1)
+    # if ifdrag == 0:
+    #     print("Drag: 0.0")
 
-    params["drag"] = initialize_mlp([1, 5, 5, 1], key)
+    #     def drag(x, v, params):
+    #         return 0.0
+    # elif ifdrag == 1:
+    #     print("Drag: nn")
 
-    acceleration_fn_model = accelerationFull(N, dim,
-                                             lagrangian=Lmodel,
-                                             constraints=constraints,
-                                             non_conservative_forces=drag)
+    #     def drag(x, v, params):
+    #         return vmap(nndrag, in_axes=(0, None))(v.reshape(-1), params["drag"]).reshape(-1, 1)
+
+    # params["drag"] = initialize_mlp([1, 5, 5, 1], key)
+
+    # acceleration_fn_model = jit(accelerationFull(N, dim,
+    #                                              lagrangian=Lmodel,
+    #                                              constraints=None,
+    #                                              non_conservative_forces=drag))
+
     v_acceleration_fn_model = vmap(acceleration_fn_model, in_axes=(0, 0, None))
 
     ################################################
@@ -345,18 +354,19 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
 
     opt_init, opt_update_, get_params = optimizers.adam(lr)
 
+    @ jit
+    def opt_update(i, grads_, opt_state):
+        grads_ = jax.tree_map(jnp.nan_to_num, grads_)
+        grads_ = jax.tree_map(
+            partial(jnp.clip, a_min=-1000.0, a_max=1000.0), grads_)
+        return opt_update_(i, grads_, opt_state)
+
     @jit
     def update(i, opt_state, params, loss__, *data):
         """ Compute the gradient for a batch and update the parameters """
         value, grads_ = gloss(params, *data)
         opt_state = opt_update(i, grads_, opt_state)
         return opt_state, get_params(opt_state), value
-
-    @ jit
-    def opt_update(i, grads_, opt_state):
-        grads_ = jax.tree_map(jnp.nan_to_num, grads_)
-        # grads_ = jax.tree_map(partial(jnp.clip, a_min=-1000.0, a_max=1000.0), grads_)
-        return opt_update_(i, grads_, opt_state)
 
     @ jit
     def step(i, ps, *args):
@@ -412,7 +422,8 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
             opt_state, params, l_ = step(
                 optimizer_step, (opt_state, params, 0), *data)
 
-        # opt_state, params, l = step(
+        # optimizer_step += 1
+        # opt_state, params, l_ = step(
         #     optimizer_step, (opt_state, params, 0), Rs, Vs, Fs)
 
         if epoch % saveat == 0:
@@ -424,21 +435,22 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
             metadata = {
                 "savedat": epoch,
                 "mpass": mpass,
+                "grid": grid,
                 "ifdrag": ifdrag,
                 "trainm": trainm,
             }
-            savefile(f"lgnn_trained_model_{ifdrag}_{trainm}.dil",
+            savefile(f"fgn_trained_model_{ifdrag}_{trainm}.dil",
                      params, metadata=metadata)
             savefile(f"loss_array_{ifdrag}_{trainm}.dil",
                      (larray, ltarray), metadata=metadata)
             if last_loss > larray[-1]:
                 last_loss = larray[-1]
-                savefile(f"lgnn_trained_model_{ifdrag}_{trainm}_low.dil",
+                savefile(f"fgn_trained_model_{ifdrag}_{trainm}_low.dil",
                          params, metadata=metadata)
 
     fig, axs = panel(1, 1)
-    plt.semilogy(larray, label="Training")
-    plt.semilogy(ltarray, label="Test")
+    plt.semilogy(larray[1:], label="Training")
+    plt.semilogy(ltarray[1:], label="Test")
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.legend()
@@ -447,11 +459,12 @@ def main(N=2, epochs=10000, seed=42, rname=True,  error_fn="L2error", mpass=1, s
     metadata = {
         "savedat": epoch,
         "mpass": mpass,
+        "grid": grid,
         "ifdrag": ifdrag,
         "trainm": trainm,
     }
     params = get_params(opt_state)
-    savefile(f"lgnn_trained_model_{ifdrag}_{trainm}.dil",
+    savefile(f"fgn_trained_model_{ifdrag}_{trainm}.dil",
              params, metadata=metadata)
     savefile(f"loss_array_{ifdrag}_{trainm}.dil",
              (larray, ltarray), metadata=metadata)

@@ -49,13 +49,37 @@ def pprint(*args, namespace=globals()):
         print(f"{namestr(arg, namespace)[0]}: {arg}")
 
 
-def main(N=3, epochs=10000, seed=42, rname=False, ifdrag=0,
-         dt=1.0e-3, stride=100, lr=0.001, datapoints=None, saveat=10, batch_size=2000):
+def wrap_main(f):
+    def fn(*args, **kwargs):
+        config = (args, kwargs)
+        print("Configs: ")
+        print(f"Args: ")
+        for i in args:
+            print(i)
+        print(f"KwArgs: ")
+        for k, v in kwargs.items():
+            print(k, ":", v)
+        return f(*args, **kwargs, config=config)
 
-    print("Configs: ")
-    pprint(N, epochs, seed, rname,
-           dt, stride, lr, batch_size,
-           namespace=locals())
+    return fn
+
+
+def Main(N=3, epochs=10000, seed=42, rname=True, saveat=10, error_fn="L2error",
+         dt=1.0e-3, ifdrag=0, stride=100, trainm=1, grid=False, mpass=1, lr=0.001,
+         withdata=None, datapoints=None, batch_size=1000):
+
+    return wrap_main(main)(N=N, epochs=epochs, seed=seed, rname=rname, saveat=saveat, error_fn=error_fn,
+                           dt=dt, ifdrag=ifdrag, stride=stride, trainm=trainm, grid=grid, mpass=mpass, lr=lr,
+                           withdata=withdata, datapoints=datapoints, batch_size=batch_size)
+
+
+def main(N=3, epochs=10000, seed=42, rname=True, saveat=10, error_fn="L2error",
+         dt=1.0e-3, ifdrag=0, stride=100, trainm=1, grid=False, mpass=1, lr=0.001, withdata=None, datapoints=None, batch_size=1000, config=None):
+
+    # print("Configs: ")
+    # pprint(N, epochs, seed, rname,
+    #        dt, stride, lr, batch_size,
+    #        namespace=locals())
 
     randfilename = datetime.now().strftime(
         "%m-%d-%Y_%H-%M-%S") + f"_{datapoints}"
@@ -86,6 +110,8 @@ def main(N=3, epochs=10000, seed=42, rname=False, ifdrag=0,
     savefile = OUT(src.io.savefile)
     save_ovito = OUT(src.io.save_ovito)
 
+    savefile(f"config_{ifdrag}_{trainm}.pkl", config)
+
     ################################################
     ################## CONFIG ######################
     ################################################
@@ -95,7 +121,7 @@ def main(N=3, epochs=10000, seed=42, rname=False, ifdrag=0,
     try:
         dataset_states = loadfile(f"model_states_{ifdrag}.pkl", tag="data")[0]
     except:
-        raise Exception("Generate dataset first.")
+        raise Exception("Generate dataset first. Use *-data.py file.")
 
     if datapoints is not None:
         dataset_states = dataset_states[:datapoints]
@@ -178,7 +204,13 @@ def main(N=3, epochs=10000, seed=42, rname=False, ifdrag=0,
     lnn_params_ke = jnp.array(np.random.randn(N))
 
     def Lmodel(x, v, params):
-        return ((params["lnn_ke"] * jnp.square(v).sum(axis=1)).sum() -
+        if trainm:
+            print("KE: 0.5mv2")
+            KE = (jnp.abs(params["lnn_ke"]) * jnp.square(v).sum(axis=1)).sum()
+        else:
+            print("KE: learned")
+            KE = (masses * jnp.square(v).sum(axis=1)).sum()
+        return (KE -
                 forward_pass(params["lnn_pe"], x.flatten(), activation_fn=SquarePlus)[0])
 
     params = {"lnn_pe": lnn_params_pe, "lnn_ke": lnn_params_ke}
@@ -209,14 +241,18 @@ def main(N=3, epochs=10000, seed=42, rname=False, ifdrag=0,
     ################## ML Training #################
     ################################################
 
+    LOSS = getattr(src.models, error_fn)
+
     @jit
     def loss_fn(params, Rs, Vs, Fs):
         pred = v_acceleration_fn_model(Rs, Vs, params)
-        return MSE(pred, Fs)
+        return LOSS(pred, Fs)
 
+    @jit
     def gloss(*args):
         return value_and_grad(loss_fn)(*args)
 
+    @jit
     def update(i, opt_state, params, loss__, *data):
         """ Compute the gradient for a batch and update the parameters """
         value, grads_ = gloss(params, *data)
@@ -270,24 +306,48 @@ def main(N=3, epochs=10000, seed=42, rname=False, ifdrag=0,
 
     part = f"{ifdrag}_{datapoints}"
 
+    last_loss = 1000
+
+    larray += [loss_fn(params, Rs, Vs, Fs)]
+    ltarray += [loss_fn(params, Rst, Vst, Fst)]
+
+    def print_loss():
+        print(
+            f"Epoch: {epoch}/{epochs} Loss (mean of {error_fn}):  train={larray[-1]}, test={ltarray[-1]}")
+
+    print_loss()
+
     for epoch in range(epochs):
-        l = 0.0
         for data in zip(bRs, bVs, bFs):
             optimizer_step += 1
             opt_state, params, l_ = step(
                 optimizer_step, (opt_state, params, 0), *data)
-            l += l_
+
+        # optimizer_step += 1
+        # opt_state, params, l_ = step(
+        #     optimizer_step, (opt_state, params, 0), Rs, Vs, Fs)
 
         if epoch % saveat == 0:
-            l = loss_fn(params, Rs, Vs, Fs)
-            larray += [l]
+            larray += [loss_fn(params, Rs, Vs, Fs)]
             ltarray += [loss_fn(params, Rst, Vst, Fst)]
-            print(f"Epoch: {epoch}/{epochs}  {larray[-1]}, {ltarray[-1]}")
+            print_loss()
+
         if epoch % saveat == 0:
-            savefile(f"lnn_trained_model_{part}.dil",
-                     params, metadata={"savedat": epoch})
-            savefile(f"loss_array_{part}.dil",
-                     (larray, ltarray), metadata={"savedat": epoch})
+            metadata = {
+                "savedat": epoch,
+                "mpass": mpass,
+                "grid": grid,
+                "ifdrag": ifdrag,
+                "trainm": trainm,
+            }
+            savefile(f"{TAG}_trained_model_{ifdrag}_{trainm}.dil",
+                     params, metadata=metadata)
+            savefile(f"loss_array_{ifdrag}_{trainm}.dil",
+                     (larray, ltarray), metadata=metadata)
+            if last_loss > larray[-1]:
+                last_loss = larray[-1]
+                savefile(f"{TAG}_trained_model_{ifdrag}_{trainm}_low.dil",
+                         params, metadata=metadata)
 
     fig, axs = panel(1, 1)
     plt.plot(larray, label="Training")
@@ -304,4 +364,4 @@ def main(N=3, epochs=10000, seed=42, rname=False, ifdrag=0,
              (larray, ltarray), metadata={"savedat": epoch})
 
 
-fire.Fire(main)
+fire.Fire(Main)

@@ -48,20 +48,23 @@ def pprint(*args, namespace=globals()):
         print(f"{namestr(arg, namespace)[0]}: {arg}")
 
 
-def main(N=2, epochs=10000, seed=42, rname=False,
-         dt=1.0e-5, stride=1000, ifdrag=0, lr=0.001, batch_size=2000):
+def main(N=2, epochs=10000, seed=42, rname=True, error_fn="L2error",
+         dt=1.0e-5, stride=1000, ifdrag=0, trainm=1, lr=0.001, batch_size=2000, datapoints=None):
 
     print("Configs: ")
     pprint(N, epochs, seed, rname,
            dt, stride, lr, batch_size,
            namespace=locals())
 
+    randfilename = datetime.now().strftime(
+        "%m-%d-%Y_%H-%M-%S") + f"_{datapoints}"
+
     PSYS = f"{N}-Pendulum"
     TAG = f"lnn"
     out_dir = f"../results"
 
     def _filename(name, tag=TAG):
-        rstring = datetime.now().strftime("%m-%d-%Y_%H-%M-%S") if rname else "0"
+        rstring = randfilename if (rname and (tag != "data")) else "0"
         filename_prefix = f"{out_dir}/{PSYS}-{tag}/{rstring}/"
         file = f"{filename_prefix}/{name}"
         os.makedirs(os.path.dirname(file), exist_ok=True)
@@ -82,6 +85,8 @@ def main(N=2, epochs=10000, seed=42, rname=False,
     savefile = OUT(src.io.savefile)
     save_ovito = OUT(src.io.save_ovito)
 
+    savefile(f"config_{ifdrag}_{trainm}.pkl", config)
+
     ################################################
     ################## CONFIG ######################
     ################################################
@@ -91,7 +96,7 @@ def main(N=2, epochs=10000, seed=42, rname=False,
     try:
         dataset_states = loadfile(f"model_states_{ifdrag}.pkl", tag="data")[0]
     except:
-        raise Exception("Generate dataset first.")
+        raise Exception("Generate dataset first. Use *-data.py file.")
 
     model_states = dataset_states[0]
 
@@ -171,7 +176,11 @@ def main(N=2, epochs=10000, seed=42, rname=False,
     lnn_params_ke = jnp.array(np.random.randn(N))
 
     def Lmodel(x, v, params):
-        return ((params["lnn_ke"] * jnp.square(v).sum(axis=1)).sum() -
+        if trainm:
+            KE = (jnp.abs(params["lnn_ke"]) * jnp.square(v).sum(axis=1)).sum()
+        else:
+            KE = (masses * jnp.square(v).sum(axis=1)).sum()
+        return (KE -
                 forward_pass(params["lnn_pe"], x.flatten(), activation_fn=SquarePlus)[0])
 
     params = {"lnn_pe": lnn_params_pe, "lnn_ke": lnn_params_ke}
@@ -202,10 +211,12 @@ def main(N=2, epochs=10000, seed=42, rname=False,
     ################## ML Training #################
     ################################################
 
+    LOSS = getattr(src.models, error_fn)
+
     @jit
     def loss_fn(params, Rs, Vs, Fs):
         pred = v_acceleration_fn_model(Rs, Vs, params)
-        return MSE(pred, Fs)
+        return LOSS(pred, Fs)
 
     def gloss(*args):
         return value_and_grad(loss_fn)(*args)
@@ -275,23 +286,23 @@ def main(N=2, epochs=10000, seed=42, rname=False,
             print(f"Epoch: {epoch}/{epochs}  {larray[-1]}, {ltarray[-1]}")
         if epoch % 10 == 0:
             savefile(f"lnn_trained_model_{ifdrag}.dil",
-                     params, metadata={"savedat": epoch})
+                     params, metadata={"savedat": epoch, "error": error_fn})
             savefile(f"loss_array_{ifdrag}.dil",
-                     (larray, ltarray), metadata={"savedat": epoch})
+                     (larray, ltarray), metadata={"savedat": epoch, "error": error_fn})
 
     fig, axs = panel(1, 1)
     plt.plot(larray, label="Training")
     plt.plot(ltarray, label="Test")
     plt.xlabel("Epoch")
-    plt.ylabel("Loss")
+    plt.ylabel(f"Loss {error_fn}")
     plt.legend()
     plt.savefig(_filename(f"training_loss_{ifdrag}.png"))
 
     params = get_params(opt_state)
     savefile(f"lnn_trained_model_{ifdrag}.dil",
-             params, metadata={"savedat": epoch})
+             params, metadata={"savedat": epoch, "error": error_fn})
     savefile(f"loss_array_{ifdrag}.dil",
-             (larray, ltarray), metadata={"savedat": epoch})
+             (larray, ltarray), metadata={"savedat": epoch, "error": error_fn})
 
 
 fire.Fire(main)

@@ -51,7 +51,7 @@ def pprint(*args, namespace=globals()):
         print(f"{namestr(arg, namespace)[0]}: {arg}")
 
 
-def main(N=2, dim=2, dt=1.0e-5, ifdrag=0, saveovito=0, semilog=1, stride=1000, seed=42, rname=0, runs=10, maxtraj=1, plotthings=False):
+def main(N=2, dim=2, dt=1.0e-5, ifdrag=0, trainm=1, saveovito=0, semilog=1, stride=1000, seed=42, rname=0, runs=10, maxtraj=1, datapoints=None, withdata=None, plotthings=False):
 
     print("Configs: ")
     pprint(dt, stride,
@@ -61,8 +61,12 @@ def main(N=2, dim=2, dt=1.0e-5, ifdrag=0, saveovito=0, semilog=1, stride=1000, s
     TAG = f"lnn"
     out_dir = f"../results"
 
+    randfilename = datetime.now().strftime(
+        "%m-%d-%Y_%H-%M-%S") + f"_{datapoints}"
+
     def _filename(name, tag=TAG):
-        rstring = datetime.now().strftime("%m-%d-%Y_%H-%M-%S") if rname else "0"
+        rstring = randfilename if (rname and (tag != "data")) else (
+            "0" if (tag == "data") or (withdata == None) else f"{withdata}")
         filename_prefix = f"{out_dir}/{PSYS}-{tag}/{rstring}/"
         file = f"{filename_prefix}/{name}"
         os.makedirs(os.path.dirname(file), exist_ok=True)
@@ -161,9 +165,20 @@ def main(N=2, dim=2, dt=1.0e-5, ifdrag=0, saveovito=0, semilog=1, stride=1000, s
     ################### ML Model ###################
     ################################################
 
-    def Lmodel(x, v, params):
-        return ((params["lnn_ke"] * jnp.square(v).sum(axis=1)).sum() -
-                forward_pass(params["lnn_pe"], x.flatten(), activation_fn=SquarePlus)[0])
+    if trainm:
+        print("KE: 0.5mv2")
+
+        def Lmodel(x, v, params):
+            KE = (jnp.abs(params["lnn_ke"]) * jnp.square(v).sum(axis=1)).sum()
+            return (KE -
+                    forward_pass(params["lnn_pe"], x.flatten(), activation_fn=SquarePlus)[0])
+    else:
+        print("KE: learned")
+
+        def Lmodel(x, v, params):
+            KE = (masses * jnp.square(v).sum(axis=1)).sum()
+            return (KE -
+                    forward_pass(params["lnn_pe"], x.flatten(), activation_fn=SquarePlus)[0])
 
     def nndrag(v, params):
         return - jnp.abs(models.forward_pass(params, v.reshape(-1), activation_fn=models.SquarePlus)) * v
